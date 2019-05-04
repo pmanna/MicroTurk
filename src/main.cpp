@@ -7,6 +7,7 @@
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include "SquarePositions.h"
+#include "MicroMax.h"
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
@@ -21,26 +22,33 @@
 #define MAX_STEPPER_SPEED 600
 #define MAX_STEPPER_ACCEL 1000
 #define MAGNET_PIN 15
+#define MAX_WATCHDOG  1000000  // Number of empty loop() calls before deciding to cut power to motors to keep them cool
 
 const long stepsPerRevolution = 2038;
-const float mmPerRevolution = 75.40; // To calibrate
+const float mmPerRevolution = 72.70; // To calibrate
 const float stepsPerMm = (float)stepsPerRevolution / mmPerRevolution;
 
 AccelStepper motor1(AccelStepper::DRIVER, 13, 12);
 AccelStepper motor2(AccelStepper::DRIVER, 27, 26);
 MultiStepper table;
 
+BLEServer *pServer;
+BLEService *pService;
+BLECharacteristic *pCharacteristic;
+
 char inData[80];
 char *outData[4] = {NULL};
 byte idx = 0;
 bool motorsEnabled = true;
 
-float movePositions[4][2] = {0};
+float movePositions[6][2] = {0};
 float currentPosition[2] = {0.0, 0.0};
 
-bool magnetStates[4] = {false, true, true, false};
+bool magnetStates[6] = {false, true, true, false, false, false};
 
 int progress = -1;
+int maxMoves = 4;
+int motorWatchdog = -1;
 
 void enableMotors()
 {
@@ -48,6 +56,8 @@ void enableMotors()
   motor2.enableOutputs();
 
   motorsEnabled = true;
+
+  motorWatchdog++;
 }
 
 void disableMotors()
@@ -56,6 +66,7 @@ void disableMotors()
   motor2.disableOutputs();
 
   motorsEnabled = false;
+  motorWatchdog = -1;
 }
 
 void resetMotors()
@@ -84,7 +95,8 @@ void moveHeadTo(float positions[2])
   steps[1] = (long)((dX - dY) * stepsPerMm);
 
 #ifdef DEBUG
-  Serial.printf("Moving by %ld %ld\n", steps[0], steps[1]);
+  Serial.printf("Moving to %.2f,%.2f by %.2f (%ld), %.2f (%ld)\n",
+                positions[0], positions[1], dX, steps[0], dY, steps[1]);
 #endif
 
   table.move(steps);
@@ -104,15 +116,49 @@ void parseSquarePos(char *moveStr)
   if (getSquarePos(moveStr[0], moveStr[1], x1, y1) &&
       getSquarePos(moveStr[2], moveStr[3], x2, y2))
   {
+    int diffX = (int)(x2 - x1);
+    int diffY = (int)(y2 - y1);
+
     progress = 0;
-    movePositions[0][0] = x1;
-    movePositions[0][1] = y1;
-    movePositions[1][0] = x1;
-    movePositions[1][1] = y1;
-    movePositions[2][0] = x2;
-    movePositions[2][1] = y2;
-    movePositions[3][0] = x2;
-    movePositions[3][1] = y2;
+    
+    // if (true)
+    if ((abs(diffX) == abs(diffY)) || diffX == 0 || diffY == 0)
+    {
+      maxMoves  = 4;
+
+      // Moving straight or diagonal, proceed
+      movePositions[0][0] = x1; magnetStates[0] = false;
+      movePositions[0][1] = y1;
+      movePositions[1][0] = x1; magnetStates[1] = true;
+      movePositions[1][1] = y1;
+      movePositions[2][0] = x2; magnetStates[2] = true;
+      movePositions[2][1] = y2;
+      movePositions[3][0] = x2; magnetStates[3] = false;
+      movePositions[3][1] = y2;
+    } else {
+      // Knight move, take a path to avoid occupied squares
+      float halfSquare  = squareSize / 2.0;
+
+      maxMoves  = 6;
+
+      movePositions[0][0] = x1; magnetStates[0] = false;
+      movePositions[0][1] = y1;
+      movePositions[1][0] = x1; magnetStates[1] = true;
+      movePositions[1][1] = y1;
+
+      magnetStates[2] = true;
+      movePositions[2][0] = x2 > x1 ? x1 + halfSquare : x1 - halfSquare;
+      movePositions[2][1] = y2 > y1 ? y1 + halfSquare : y1 - halfSquare;
+
+      magnetStates[3] = true;
+      movePositions[3][0] = x2 > x1 ? x2 - halfSquare : x2 + halfSquare;
+      movePositions[3][1] = y2 > y1 ? y2 - halfSquare : y2 + halfSquare;
+
+      movePositions[4][0] = x2; magnetStates[4] = true;
+      movePositions[4][1] = y2;
+      movePositions[5][0] = x2; magnetStates[5] = false;
+      movePositions[5][1] = y2;
+   }
   }
 }
 
@@ -254,6 +300,7 @@ void parseCommand(const char *cmdStr)
   }
   else
   {
+//    inputPlayerMove(outData[0]);
     parseSquarePos(outData[0]);
   }
   delay(500);
@@ -300,8 +347,6 @@ class MyCallbacks : public BLECharacteristicCallbacks
       cmdStr[strlen(cmdStr) - 1]  = '\0';
       
       parseCommand(cmdStr);
-
-      pCharacteristic->setValue("OK");
     }
   }
 };
@@ -311,13 +356,11 @@ void setup()
   Serial.begin(115200);
 
   BLEDevice::init("MicroTurk");
-  BLEServer *pServer = BLEDevice::createServer();
-
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-
-  BLECharacteristic *pCharacteristic = pService->createCharacteristic(
-      CHARACTERISTIC_UUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  
+  pServer = BLEDevice::createServer();
+  pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
 
   pCharacteristic->setCallbacks(new MyCallbacks());
 
@@ -326,6 +369,8 @@ void setup()
 
   BLEAdvertising *pAdvertising = pServer->getAdvertising();
   pAdvertising->start();
+
+  // initUMax();
 
   pinMode(MAGNET_PIN, OUTPUT);
 
@@ -354,16 +399,42 @@ void loop()
 {
   if (!table.run())
   {
+    if (motorWatchdog >= 0)  // NOTE: in here because we don't want motor to stop while is moving!
+    {
+      motorWatchdog++;
+      if (motorWatchdog > MAX_WATCHDOG) {
+#ifdef DEBUG
+        Serial.println("Watchdog fired, disabling motors");
+#endif
+        disableMotors();
+      }
+    }
+
     if (progress < 0)
     {
       parseInput();
     }
     else
     {
-      if (progress >= 4)
+      if (progress >= maxMoves)
       {
+        // char  turkMove[40] = {0};
+
         progress = -1;
         disableMotors();
+        /*
+#ifdef DEBUG
+        Serial.println("Turk turn...");
+#endif
+        getUMaxMove(turkMove);
+#ifdef DEBUG
+        Serial.print("Move: "); Serial.println(turkMove);
+#endif
+        */
+
+        pCharacteristic->setValue("OK\n");
+        pCharacteristic->notify();
+
         return;
       }
 
@@ -382,8 +453,5 @@ void loop()
       delay(500);
     }
   }
-  else
-  {
-    // Serial.print(".");
-  }
+  else {}
 }
